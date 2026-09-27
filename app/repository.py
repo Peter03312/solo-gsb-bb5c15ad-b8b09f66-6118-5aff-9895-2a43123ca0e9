@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -742,6 +743,150 @@ def load_conflict_group_inputs(
         "closure_conflicts_by_runway": conflicts_by_runway,
         "capacity_violations_by_runway": capacity_by_runway,
     }
+
+
+def load_batch_header(conn: sqlite3.Connection, batch_id: str) -> dict | None:
+    """Batch ``mode``/``created_at`` (``None`` when the batch is unknown)."""
+    row = conn.execute(
+        "SELECT mode, created_at FROM batches WHERE batch_id = ?",
+        (batch_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"mode": row["mode"], "created_at": row["created_at"]}
+
+
+def _flights_by_runway(conn: sqlite3.Connection, batch_id: str) -> dict[str, list[Flight]]:
+    flights_by_runway: dict[str, list[Flight]] = {}
+    for fr in conn.execute(
+        "SELECT runway, flight_no, scheduled_off, wake FROM flights"
+        " WHERE batch_id = ? ORDER BY runway, position",
+        (batch_id,),
+    ):
+        flights_by_runway.setdefault(fr["runway"], []).append(
+            Flight(
+                flight_no=fr["flight_no"],
+                scheduled_off=_dt(fr["scheduled_off"]),
+                wake=fr["wake"],
+                runway=fr["runway"],
+            )
+        )
+    return flights_by_runway
+
+
+def _frozen_constraints(
+    conn: sqlite3.Connection, batch_id: str
+) -> tuple[
+    dict[tuple[str, str], int],
+    dict[str, list[ClosureWindow]],
+    dict[str, Capacity],
+]:
+    """Reconstruct the frozen matrix/closure windows/capacity of a batch."""
+    row = conn.execute(
+        "SELECT matrix_json FROM batches WHERE batch_id = ?",
+        (batch_id,),
+    ).fetchone()
+    matrix = {
+        tuple(pair.split("->", 1)): seconds
+        for pair, seconds in json.loads(row["matrix_json"]).items()
+    }
+    windows_by_runway: dict[str, list[ClosureWindow]] = {}
+    for cr in conn.execute(
+        "SELECT runway, start_utc, end_utc FROM closures"
+        " WHERE batch_id = ? ORDER BY runway, window_index",
+        (batch_id,),
+    ):
+        windows_by_runway.setdefault(cr["runway"], []).append(
+            ClosureWindow(start=_dt(cr["start_utc"]), end=_dt(cr["end_utc"]))
+        )
+    capacity_by_runway: dict[str, Capacity] = {}
+    for cr in conn.execute(
+        "SELECT runway, window_seconds, max_departures FROM capacities"
+        " WHERE batch_id = ?",
+        (batch_id,),
+    ):
+        capacity_by_runway[cr["runway"]] = Capacity(
+            window_seconds=cr["window_seconds"],
+            max_departures=cr["max_departures"],
+        )
+    return matrix, windows_by_runway, capacity_by_runway
+
+
+@dataclass(frozen=True, slots=True)
+class ActualRow:
+    """One reported departure actual as persisted for a batch."""
+
+    flight_no: str
+    actual_off: datetime
+    revision: int
+
+
+def load_actuals(conn: sqlite3.Connection, batch_id: str) -> dict[str, ActualRow]:
+    """All reported actuals of a batch, keyed by flight number."""
+    rows = {}
+    for ar in conn.execute(
+        "SELECT flight_no, actual_off, revision FROM actuals WHERE batch_id = ?",
+        (batch_id,),
+    ):
+        rows[ar["flight_no"]] = ActualRow(
+            flight_no=ar["flight_no"],
+            actual_off=_dt(ar["actual_off"]),
+            revision=ar["revision"],
+        )
+    return rows
+
+
+def load_actual_audit_inputs(conn: sqlite3.Connection, batch_id: str) -> dict | None:
+    """Frozen validate-batch definition plus every reported actual.
+
+    Returns ``None`` when the batch does not exist; otherwise a dict with the
+    batch ``mode``/``created_at``, the frozen matrix, per-runway planned
+    flights (stable order), closure windows and capacity limit, and the
+    current ``actuals`` mapping ``flight_no -> ActualRow``. The frozen plan
+    and reservation books are never touched.
+    """
+    header = load_batch_header(conn, batch_id)
+    if header is None:
+        return None
+    matrix, windows_by_runway, capacity_by_runway = _frozen_constraints(
+        conn, batch_id
+    )
+    return {
+        "mode": header["mode"],
+        "created_at": header["created_at"],
+        "matrix": matrix,
+        "flights_by_runway": _flights_by_runway(conn, batch_id),
+        "windows_by_runway": windows_by_runway,
+        "capacity_by_runway": capacity_by_runway,
+        "actuals": load_actuals(conn, batch_id),
+    }
+
+
+def upsert_actual(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: str,
+    flight_no: str,
+    actual_off: datetime,
+    revision: int,
+) -> None:
+    """Insert a flight's actual, or replace it under the (batch, flight) key.
+
+    The caller is responsible for the revision rules (higher replaces, equal
+    revision with the same value is idempotent, lower/equal-different is
+    rejected before reaching here) and for running inside a write
+    transaction.
+    """
+    reported_at = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO actuals (batch_id, flight_no, actual_off, revision, reported_at)"
+        " VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(batch_id, flight_no) DO UPDATE SET"
+        " actual_off = excluded.actual_off,"
+        " revision = excluded.revision,"
+        " reported_at = excluded.reported_at",
+        (batch_id, flight_no, _iso(actual_off), revision, reported_at),
+    )
 
 
 def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:

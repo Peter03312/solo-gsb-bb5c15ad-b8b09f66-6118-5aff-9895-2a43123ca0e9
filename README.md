@@ -55,6 +55,16 @@
    时间均不变**，其他航班不移动），可行才取消并返回 `204`、立即释放时隙。并发取消与
    预约共用写锁串行化：**两个各自可行但合并不可行的并发取消至多一个成功**。固定计划
    不可取消，重复取消仍返回 `204`，未知簿或预约返回 `404`。
+8. **离场实绩审计（actuals / actual-audit）**：挂接在**已保存的 validate 批次**上，
+   **不改动原计划与预约簿**。`POST .../actuals` 批量接收 `flight_no`、**带时区**
+   `actual_off` 与**正整数** `revision`：同一航班**高版本替换**、**等版本同值幂等**、
+   **低版本或等版本异值返回 409**，未知航班或批内重复航班返回 `422`，**整批原子处理**
+   （任一失败全部回滚）。`GET .../actual-audit` 按跑道**仅取已上报航班**，按
+   **(实际时刻, 航班号)** 稳定排序，沿用该批次**冻结的尾流矩阵、关闭窗口与滚动容量**
+   规则重算违规，返回违规明细、各航班**当前版本**与**未上报名单**。审计结果每次读取
+   都由冻结批次 + 当前实绩重新推导：补报或更正改变相邻关系及容量窗口时，原先成立的
+   违规会被**自动撤掉**，服务**重启后结果完全一致**。未知批次返回 `404`，非
+   validate 批次返回 `422`。
 
 **兼容形状**：未在任何航班上传 `locked` 字段时，validate/trial/批次回查的响应与旧版本
 完全一致（不出现 `locked`、`locked_flights`、`blocked`、`total_locked` 字段）；显式传了
@@ -79,6 +89,9 @@ docker compose up -d --build
 - 默认间隔矩阵：http://localhost:8000/matrix/default
 
 停止：`docker compose down`（数据保留在命名卷 `wake-data` 中；加 `-v` 可一并清除）。
+
+镜像启动时自动安装依赖、创建/升级 SQLite 表结构（含离场实绩表，旧库随启动原地迁移，
+无需手工建表或干预），随后在 8000 端口提供服务。
 
 ## 必要配置（环境变量）
 
@@ -587,6 +600,71 @@ capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的�
 该接口为**只读查询**，不改写任何数据；批次不存在返回 `404`，批次模式不是
 `validate`（trial / best_adjacent_swap / joint_trial）返回 `422`。
 
+### `POST /api/v1/batches/{batch_id}/actuals` — 批量上报离场实绩
+
+针对**已保存的 validate 批次**批量上报航班实际离场时刻。**只挂接实绩，不修改冻结
+计划，也不影响时隙预约簿**。请求体：
+
+```json
+{
+  "actuals": [
+    {"flight_no": "CA101", "actual_off": "2026-09-18T08:00:12+08:00", "revision": 1},
+    {"flight_no": "CA102", "actual_off": "2026-09-18T08:02:05+08:00", "revision": 1}
+  ]
+}
+```
+
+- `actuals` 至少 1 条；每条：
+  - `flight_no`：航班号，必须属于该批次的**冻结计划**（不存在返回 `422`）；
+  - `actual_off`：实际离场时刻，ISO 8601 且**必须带时区**，服务端归一化为 UTC；
+  - `revision`：修订号，**正整数**（`0`/负数/小数/字符串/布尔均拒绝，`422`）。
+- **修订号语义（同一航班）**：
+  - **高版本替换**：`revision` 大于已保存值时覆盖实际时刻；
+  - **等版本同值幂等**：`revision` 相同且 `actual_off`（按 UTC 归一化）一致时
+    原样成功、不重写记录（响应 `status="unchanged"`），可用不同时区表达同一时刻；
+  - **低版本**或**等版本异值**：整批拒绝（`409`，中文原因列出冲突航班）。
+- 同一请求内航班号**重复**返回 `422`。
+- **整批原子处理**：所有校验先于任何写入；任一条触发 409/422 时同批其他本可接受的
+  记录也一并回滚（写入在 `BEGIN IMMEDIATE` 事务内完成，并发上报按写锁串行化，
+  等待超时返回 `503`）。
+- 批次不存在返回 `404`；非 validate 批次（trial / best-adjacent-swap /
+  joint_trial）返回 `422`。
+- 成功返回 `accepted_count` 与 `accepted`（按请求顺序，每条含 `flight_no` /
+  `actual_off`（UTC）/ `revision` / `status`，`status` 为
+  `created` 首次上报 / `replaced` 高版本替换 / `unchanged` 幂等重放），以及提交后
+  立即重算的审计结果，字段与下面的 GET 响应完全一致。
+
+### `GET /api/v1/batches/{batch_id}/actual-audit` — 离场实绩审计（只读）
+
+按冻结规则对**当前已上报实绩**重新审计（结果不落库，每次读取实时重算）：
+
+- 每条跑道**仅包含已上报航班**，按 **(实际时刻, 航班号)** 稳定排序；未上报航班
+  **不参与**任何相邻关系、关闭窗口与容量计数。
+- 沿用该批次 validate 时**冻结**的：
+  - **尾流矩阵**：对上报序列的相邻对计算间隔违规，明细字段同 validate
+    （`leader` / `follower` / 尾流等级 / 要求与实际秒数 / 缺口 / 相邻位次，
+    时刻字段为 `leader_actual_off` / `follower_actual_off`）；
+  - **关闭窗口**：实际离场时刻落入窗口的航班列入 `closure_conflicts`
+    （时刻字段为 `actual_off`，含命中窗口 1 基序号与起止）；
+  - **滚动容量**：对上报序列重算容量超限，`capacity_violations` 给出锚机航班、
+    触发窗口 `[window_start, window_end)`、窗口内架次与最早合规时刻
+    （时刻字段为 `actual_off`）。仅当跑道冻结配置了 capacity 时，响应才出现
+    `capacity` / `capacity_violation_count` / `capacity_violations` 与顶层
+    `total_capacity_violations`（兼容形状同 validate）。
+- 顶层字段：`batch_id` / `mode`（`validate`）/ `created_at` / `total_runways` /
+  `total_reported`（全批已上报架次）/ `total_unreported` / `total_violations` /
+  `total_closure_conflicts`（/ `total_capacity_violations`）。
+- 每条跑道：`runway` / `order`（上报航班的实际时刻顺序）/ `reported_count` /
+  三类违规列表及计数 / `current_revisions`（按 (实际时刻, 航班号) 排序，每项含
+  `position` / `flight_no` / `actual_off` / `revision`）/ `unreported` 与
+  `unreported_count`（冻结计划中尚未上报的航班，按**计划稳定位次**排列，每项含
+  `planned_position` / `flight_no` / `wake` / `scheduled_off`）；所有跑道（含
+  尚未有任何上报的）都按跑道名排序列出。
+- **补报或更正自动重算**：补报落在两机之间的航班会改变相邻对（旧的跨航班尾流违规
+  随之失效）；更正实际时刻会改变关闭窗口命中与滚动容量窗口。失效违规每次读取时
+  都会被自然撤掉，无需额外操作；审计仅依赖冻结批次与实绩表，**重启后结果一致**。
+- 批次不存在返回 `404`；非 validate 批次返回 `422`。
+
 ### 间隔矩阵（可选字段 `matrix`）
 
 请求可携带 `matrix` 覆盖默认矩阵：
@@ -620,14 +698,17 @@ capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的�
   组名重复/组间隔非正整数等），或 best-adjacent-swap 请求含任意 `locked=true`
   航班，或 slots/insert 请求中候选号与现有航班重复、候选最早时刻晚于最晚时刻、
   时刻未精确到整秒、**现有计划本身违反尾流/关闭窗口/容量约束**，或创建预约簿时
-  待冻结计划违反上述约束，或对非 validate 模式的批次请求 conflict-groups，
+  待冻结计划违反上述约束，或对非 validate 模式的批次请求 conflict-groups /
+  上报离场实绩 / 查询实绩审计，或实绩上报中航班不属于冻结批次、批内航班号重复、
+  修订号非正整数、实际时刻缺时区，
   响应体含中文原因。
 - `404`：批次 ID、预约簿 ID 或预约 ID 不存在。
 - `409`：预约区间内无空档，或同簿航班号重复（固定计划或有效预约中已存在），或
   取消预约会使删除后的固定计划与有效预约违反冻结的尾流间隔（及关闭窗口/滚动容量）
-  约束——响应体明细列出冲突前后航班、要求与实际间隔，预约状态与取消时间不变。
+  约束——响应体明细列出冲突前后航班、要求与实际间隔，预约状态与取消时间不变；
+  或离场实绩上报遇到**低修订号**、**等修订号但实际时刻不一致**（整批拒绝）。
 - `204`：取消预约成功（含重复取消，幂等），无响应体。
-- `503`：并发预约等待数据库写锁超时（默认 30 秒），可安全重试。
+- `503`：并发预约/实绩上报等待数据库写锁超时（默认 30 秒），可安全重试。
 
 ---
 
@@ -678,6 +759,20 @@ curl -s http://localhost:8000/api/v1/batches/<batch_id>
 # 离场冲突分组（只读；仅 validate 批次，其他模式 422，批次不存在 404）
 curl -s http://localhost:8000/api/v1/batches/<batch_id>/conflict-groups
 
+# ---- 离场实绩上报与审计（挂接已保存 validate 批次，不改原计划/预约）----
+
+# 批量上报实际离场时刻（高版本替换 / 等版本同值幂等 / 低版本或等版本异值 409；
+# 未知或批内重复航班 422；整批原子处理；未知批次 404，非 validate 批次 422）
+curl -s -X POST http://localhost:8000/api/v1/batches/<batch_id>/actuals \
+  -H 'Content-Type: application/json' \
+  -d '{"actuals": [
+        {"flight_no": "CA101", "actual_off": "2026-09-18T08:00:12+08:00", "revision": 1},
+        {"flight_no": "CA102", "actual_off": "2026-09-18T08:02:05+08:00", "revision": 1}]}'
+
+# 离场实绩审计（只读：按实际时刻排序，沿用冻结矩阵/关闭窗口/容量重算违规，
+# 返回明细、当前版本与未上报名单）
+curl -s http://localhost:8000/api/v1/batches/<batch_id>/actual-audit
+
 # ---- 跑道时隙预约簿 ----
 
 # 创建预约簿（冻结单跑道计划与约束；计划不可行返回 422）
@@ -723,7 +818,7 @@ export WAKE_DB_PATH=./wake.db            # 可选，默认 /data/wake.db
 uvicorn app.main:app --reload --port 8000
 ```
 
-运行测试（含 186 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
+运行测试（含 215 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
 
 ```bash
 python3 -m pip install pytest httpx
@@ -734,16 +829,17 @@ python3 -m pytest -q
 
 ```
 app/
-  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / slots/insert / slot-books 预约簿 / batches / batches/{id}/conflict-groups / 元信息）
-  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定/互斥组/候选插入/冲突分组/预约簿与预约合法性与兼容序列化）
+  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / slots/insert / slot-books 预约簿 / batches / batches/{id}/conflict-groups / batches/{id}/actuals 实绩上报 / batches/{id}/actual-audit 实绩审计 / 元信息）
+  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定/互斥组/候选插入/冲突分组/预约簿与预约/实绩上报与审计合法性与兼容序列化）
+  actuals.py      # 离场实绩：整批原子提交（修订号高版本替换/等版本幂等/低版本或等版本异值 409、未知或批内重复 422）与按冻结矩阵/关闭窗口/容量重算的只读实绩审计（补报更正自动撤消失效违规）
   service.py      # 请求 -> 领域对象 -> 模式计算（含插入查询与预约簿建簿的现有计划 422 预检、事务内预约求解与删除目标后的冻结约束复检）
   joint.py        # 联合试排：全局稳定顺序、尾流/关闭/容量/互斥组间隔不动点迭代、锁定阻塞与各约束所需时刻
   separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、相邻交换枚举择优、候选插入空档搜索、离场冲突连通分组、预约记录、默认矩阵
   timeutils.py    # 时区归一化（统一 UTC，整数秒运算）
-  database.py     # SQLite 连接、建表与旧库迁移（含 batches.mode CHECK 重建、互斥组表、预约簿/预约表与 BEGIN IMMEDIATE 预约事务）
-  repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排/交换/联合试排（含互斥组与各约束所需时刻）的持久化与回查、冲突分组数据加载、预约簿与预约的冻结/读取/写入/取消
+  database.py     # SQLite 连接、建表与旧库迁移（含 batches.mode CHECK 重建、互斥组表、预约簿/预约表、离场实绩表与 BEGIN IMMEDIATE 写事务）
+  repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排/交换/联合试排（含互斥组与各约束所需时刻）的持久化与回查、冲突分组与实绩审计数据加载、实绩 upsert、预约簿与预约的冻结/读取/写入/取消
   config.py       # 环境变量配置
-tests/            # pytest 领域单测 + TestClient API 测试（含并发预约用例）
+tests/            # pytest 领域单测 + TestClient API 测试（含并发预约与实绩修订/重启一致性用例）
 Dockerfile
 docker-compose.yml
 sample.json       # 含关闭窗口与滚动容量约束的示例请求

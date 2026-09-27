@@ -236,6 +236,22 @@ CREATE TABLE IF NOT EXISTS reservations (
     cancelled_at   TEXT
 );
 
+-- Departure actuals reported against a saved validate batch. One row per
+-- (batch, flight): a higher revision replaces the stored actual, an equal
+-- revision with the same value is an idempotent no-op, anything older (or an
+-- equal revision carrying a different value) is rejected. The frozen plan
+-- (flights/closures/capacities/matrix) is never copied or modified; audit
+-- results are recomputed on read from the frozen batch plus these rows.
+CREATE TABLE IF NOT EXISTS actuals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+    flight_no    TEXT NOT NULL,
+    actual_off   TEXT NOT NULL,
+    revision     INTEGER NOT NULL CHECK (revision >= 1),
+    reported_at  TEXT NOT NULL,
+    UNIQUE(batch_id, flight_no)
+);
+
 CREATE INDEX IF NOT EXISTS idx_flights_batch ON flights(batch_id);
 CREATE INDEX IF NOT EXISTS idx_violations_batch ON violations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_trial_batch ON trial_items(batch_id);
@@ -254,6 +270,7 @@ CREATE INDEX IF NOT EXISTS idx_reservations_book ON reservations(book_id);
 -- booking transaction, this index is the last line of defence.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_active_flight
     ON reservations(book_id, flight_no) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_actuals_batch ON actuals(batch_id);
 """
 
 # Columns added after the initial release: existing database files (e.g. the
@@ -432,5 +449,17 @@ def immediate_conn(db_path: str | None = None) -> Iterator[sqlite3.Connection]:
 
 def get_booking_db() -> Iterator[sqlite3.Connection]:
     """FastAPI dependency: booking transaction (``BEGIN IMMEDIATE``)."""
+    with immediate_conn() as conn:
+        yield conn
+
+
+def get_write_db() -> Iterator[sqlite3.Connection]:
+    """FastAPI dependency: batch actuals submission (``BEGIN IMMEDIATE``).
+
+    Validating the whole batch against the stored actuals and upserting it
+    must be one atomic write unit: validation failures roll every accepted
+    row of the same request back, and concurrent submissions serialise on
+    SQLite's write lock instead of racing on the revision check.
+    """
     with immediate_conn() as conn:
         yield conn

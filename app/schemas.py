@@ -399,6 +399,48 @@ class SlotBookCreateRequest(BaseModel):
         return self
 
 
+class ActualItemIn(BaseModel):
+    """一条离场实绩：航班号、带时区实际离场时刻与正整数修订号。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    flight_no: str = Field(..., min_length=1, examples=["CA1234"])
+    actual_off: datetime = Field(
+        ...,
+        description="实际离场时刻，ISO 8601，必须带时区，例如 2026-09-18T08:01:30+08:00",
+    )
+    revision: int = Field(
+        ...,
+        ge=1,
+        strict=True,
+        description="修订号（正整数）：高版本替换已保存实绩，等版本同值幂等，"
+        "低版本或等版本异值返回 409。",
+    )
+
+    @field_validator("flight_no")
+    @classmethod
+    def _strip_flight_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("flight_no 不能为空")
+        return v
+
+    @field_validator("actual_off")
+    @classmethod
+    def _require_timezone(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("actual_off 必须携带时区信息（ISO 8601 offset 或 Z）")
+        return v
+
+
+class ActualsSubmitRequest(BaseModel):
+    """批量上报离场实绩（至少一条）；整批原子处理。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actuals: list[ActualItemIn] = Field(..., min_length=1)
+
+
 class ReservationIn(CandidateIn):
     """预约请求：航班号、尾流类别与最早/最晚离场时刻（闭区间、整秒）。"""
 
@@ -1259,6 +1301,181 @@ class BatchResponse(BaseModel):
             value = getattr(self, name)
             if value is not None:
                 data[name] = value
+        return data
+
+
+# ---------- departure-actual audit ----------
+
+
+class ActualViolationOut(BaseModel):
+    """已上报实绩序列上的相邻尾流间隔违规。"""
+
+    leader: str
+    follower: str
+    leader_wake: Wake
+    follower_wake: Wake
+    leader_actual_off: datetime
+    follower_actual_off: datetime
+    required_seconds: int
+    actual_seconds: int
+    shortfall_seconds: int
+    leader_position: int
+    follower_position: int
+
+
+class ActualClosureConflictOut(BaseModel):
+    """已上报航班实际离场时刻落入冻结关闭窗口。"""
+
+    flight_no: str
+    wake: Wake
+    actual_off: datetime
+    position: int
+    window_index: int
+    window_start: datetime
+    window_end: datetime
+
+
+class ActualCapacityViolationOut(BaseModel):
+    """已上报实绩序列上的滚动容量超限（沿用批次冻结容量规则）。"""
+
+    flight_no: str
+    wake: Wake
+    actual_off: datetime
+    position: int
+    window_seconds: int
+    max_departures: int
+    departures_in_window: int
+    anchor_flight_no: str
+    anchor_position: int
+    window_start: datetime
+    window_end: datetime
+    earliest_compliant_off: datetime
+
+
+class ActualCurrentRevisionOut(BaseModel):
+    """已上报航班的当前修订号（按 (实际时刻, 航班号) 排序）。"""
+
+    position: int
+    flight_no: str
+    actual_off: datetime
+    revision: int
+
+
+class UnreportedFlightOut(BaseModel):
+    """冻结计划中尚未上报实绩的航班（按计划稳定位次排序）。"""
+
+    planned_position: int
+    flight_no: str
+    wake: Wake
+    scheduled_off: datetime
+
+
+class RunwayActualAuditOut(BaseModel):
+    runway: str
+    order: list[str]
+    reported_count: int
+    violations: list[ActualViolationOut]
+    violation_count: int
+    closure_conflicts: list[ActualClosureConflictOut]
+    closure_conflict_count: int
+    # 冻结容量配置：沿用 validate 的兼容形状，仅配置了 capacity 的跑道出现
+    # capacity 与 capacity_* 字段。
+    has_capacity: bool = Field(default=False, exclude=True)
+    capacity: CapacityOut | None = None
+    capacity_violations: list[ActualCapacityViolationOut] = Field(
+        default_factory=list
+    )
+    capacity_violation_count: int = 0
+    current_revisions: list[ActualCurrentRevisionOut]
+    unreported: list[UnreportedFlightOut]
+    unreported_count: int
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "runway": self.runway,
+            "order": self.order,
+            "reported_count": self.reported_count,
+            "violation_count": self.violation_count,
+            "violations": [v.model_dump(mode="json") for v in self.violations],
+            "closure_conflict_count": self.closure_conflict_count,
+            "closure_conflicts": [
+                c.model_dump(mode="json") for c in self.closure_conflicts
+            ],
+            "current_revisions": [
+                r.model_dump(mode="json") for r in self.current_revisions
+            ],
+            "unreported_count": self.unreported_count,
+            "unreported": [u.model_dump(mode="json") for u in self.unreported],
+        }
+        if self.has_capacity:
+            data["capacity"] = (
+                self.capacity.model_dump() if self.capacity is not None else None
+            )
+            data["capacity_violation_count"] = self.capacity_violation_count
+            data["capacity_violations"] = [
+                v.model_dump(mode="json") for v in self.capacity_violations
+            ]
+        return data
+
+
+class ActualAuditResponse(BaseModel):
+    """离场实绩审计结果（每次读取按冻结矩阵/关闭窗口/容量与当前实绩重算）。"""
+
+    batch_id: str
+    mode: str = "validate"
+    created_at: datetime
+    total_runways: int
+    total_reported: int
+    total_unreported: int
+    total_violations: int
+    total_closure_conflicts: int
+    has_capacity: bool = Field(default=False, exclude=True)
+    total_capacity_violations: int = 0
+    runways: list[RunwayActualAuditOut]
+
+    def _base_payload(self) -> dict:
+        data: dict = {
+            "batch_id": self.batch_id,
+            "mode": self.mode,
+            "created_at": self.created_at,
+            "total_runways": self.total_runways,
+            "total_reported": self.total_reported,
+            "total_unreported": self.total_unreported,
+            "total_violations": self.total_violations,
+            "total_closure_conflicts": self.total_closure_conflicts,
+            "runways": [rw.model_dump(mode="json") for rw in self.runways],
+        }
+        if self.has_capacity:
+            data["total_capacity_violations"] = self.total_capacity_violations
+        return data
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        return self._base_payload()
+
+
+class AcceptedActualOut(BaseModel):
+    """整批提交中单条实绩的落库结果（按请求顺序）。"""
+
+    flight_no: str
+    actual_off: datetime
+    revision: int
+    # created 首次上报；replaced 高版本替换；unchanged 等版本同值幂等
+    status: Literal["created", "replaced", "unchanged"]
+
+
+class ActualsSubmitResponse(ActualAuditResponse):
+    """提交响应：本批各条落库结果 + 提交后的即时审计结果。"""
+
+    accepted_count: int
+    accepted: list[AcceptedActualOut]
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data = self._base_payload()
+        data["accepted_count"] = self.accepted_count
+        data["accepted"] = [a.model_dump(mode="json") for a in self.accepted]
         return data
 
 

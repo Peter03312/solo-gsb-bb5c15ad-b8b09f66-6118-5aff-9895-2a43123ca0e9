@@ -8,15 +8,24 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from .database import get_booking_db, get_db, init_db
+from .database import get_booking_db, get_db, get_write_db, init_db
 from .repository import (
     load_batch,
+    load_actual_audit_inputs,
     load_conflict_group_inputs,
     load_slot_book,
     save_batch,
     save_slot_book,
 )
 from .schemas import (
+    AcceptedActualOut,
+    ActualAuditResponse,
+    ActualCapacityViolationOut,
+    ActualClosureConflictOut,
+    ActualCurrentRevisionOut,
+    ActualsSubmitRequest,
+    ActualsSubmitResponse,
+    ActualViolationOut,
     BaselineMetricsOut,
     BatchResponse,
     BestAdjacentSwapResponse,
@@ -44,6 +53,7 @@ from .schemas import (
     RunwaySwapOut,
     RunwayTrialOut,
     RunwayJointOut,
+    RunwayActualAuditOut,
     SlotBookCreateRequest,
     SlotBookFlightOut,
     SlotBookOut,
@@ -53,9 +63,18 @@ from .schemas import (
     TrialBlockedOut,
     TrialItemOut,
     TrialResponse,
+    UnreportedFlightOut,
     ValidateResponse,
     WakeRequest,
     default_matrix_nested,
+)
+from .actuals import (
+    ActualAudit,
+    ActualIn,
+    ActualsSubmissionError,
+    RunwayActualAudit,
+    build_actual_audit,
+    submit_actuals,
 )
 from .separation import ClosureWindow, Reservation, build_conflict_groups, delay_stats
 from .service import (
@@ -121,8 +140,16 @@ app = FastAPI(
         "移动）；固定计划不可取消，重复取消返回 204，未知簿或预约"
         "返回 404；读取、校验、写入与预约共用 BEGIN IMMEDIATE 写"
         "事务串行化。"
+        "actuals/actual-audit 为挂接在已保存 validate 批次上的离场实绩"
+        "审计（不改原计划与预约）：POST 批量接收 flight_no、带时区 "
+        "actual_off 与正整数 revision，同航班高版本替换、等版本同值幂等、"
+        "低版本或等版本异值 409，未知或批内重复航班 422，整批原子处理；"
+        "GET 按跑道仅将已上报航班按 (实际时刻, 航班号) 排序，沿用批次"
+        "冻结矩阵、关闭窗口与滚动容量重算违规，返回明细、当前版本与未上报"
+        "名单；补报或更正自动重算相邻关系与容量窗口、撤掉失效违规，"
+        "重启后结果一致；未知批次 404，非 validate 批次 422。"
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -165,6 +192,8 @@ def root() -> dict:
             ),
             "batch": "GET /api/v1/batches/{batch_id}",
             "conflict_groups": "GET /api/v1/batches/{batch_id}/conflict-groups",
+            "actuals": "POST /api/v1/batches/{batch_id}/actuals",
+            "actual_audit": "GET /api/v1/batches/{batch_id}/actual-audit",
         },
     }
 
@@ -1144,3 +1173,206 @@ def get_conflict_groups(
         total_groups=total_groups,
         runways=runway_outs,
     )
+
+
+def _runway_actual_audit_out(rw: RunwayActualAudit) -> RunwayActualAuditOut:
+    has_capacity = rw.capacity is not None
+    return RunwayActualAuditOut(
+        runway=rw.runway,
+        order=rw.order,
+        reported_count=rw.reported_count,
+        violations=[
+            ActualViolationOut(
+                leader=v.leader_no,
+                follower=v.follower_no,
+                leader_wake=v.leader_wake,
+                follower_wake=v.follower_wake,
+                leader_actual_off=v.leader_time,
+                follower_actual_off=v.follower_time,
+                required_seconds=v.required_seconds,
+                actual_seconds=v.actual_seconds,
+                shortfall_seconds=v.shortfall_seconds,
+                leader_position=v.leader_position,
+                follower_position=v.follower_position,
+            )
+            for v in rw.violations
+        ],
+        violation_count=len(rw.violations),
+        closure_conflicts=[
+            ActualClosureConflictOut(
+                flight_no=c.flight_no,
+                wake=c.wake,
+                actual_off=c.scheduled_off,
+                position=c.position,
+                window_index=c.window_index,
+                window_start=c.window_start,
+                window_end=c.window_end,
+            )
+            for c in rw.closure_conflicts
+        ],
+        closure_conflict_count=len(rw.closure_conflicts),
+        has_capacity=has_capacity,
+        capacity=_capacity_out(rw.capacity) if rw.capacity is not None else None,
+        capacity_violations=[
+            ActualCapacityViolationOut(
+                flight_no=cv.flight_no,
+                wake=cv.wake,
+                actual_off=cv.scheduled_off,
+                position=cv.position,
+                window_seconds=cv.window_seconds,
+                max_departures=cv.max_departures,
+                departures_in_window=cv.departures_in_window,
+                anchor_flight_no=cv.anchor_flight_no,
+                anchor_position=cv.anchor_position,
+                window_start=cv.anchor_off,
+                window_end=cv.window_end,
+                earliest_compliant_off=cv.earliest_compliant_off,
+            )
+            for cv in rw.capacity_violations
+        ],
+        capacity_violation_count=len(rw.capacity_violations),
+        current_revisions=[
+            ActualCurrentRevisionOut(
+                position=cur.position,
+                flight_no=cur.flight_no,
+                actual_off=cur.actual_off,
+                revision=cur.revision,
+            )
+            for cur in rw.current_revisions
+        ],
+        unreported=[
+            UnreportedFlightOut(
+                planned_position=u.planned_position,
+                flight_no=u.flight_no,
+                wake=u.wake,
+                scheduled_off=u.scheduled_off,
+            )
+            for u in rw.unreported
+        ],
+        unreported_count=len(rw.unreported),
+    )
+
+
+def _actual_audit_response(audit: ActualAudit) -> ActualAuditResponse:
+    runways = [_runway_actual_audit_out(rw) for rw in audit.runways]
+    has_capacity = any(rw.capacity is not None for rw in audit.runways)
+    return ActualAuditResponse(
+        batch_id=audit.batch_id,
+        created_at=audit.created_at,
+        total_runways=len(audit.runways),
+        total_reported=sum(rw.reported_count for rw in audit.runways),
+        total_unreported=sum(len(rw.unreported) for rw in audit.runways),
+        total_violations=sum(len(rw.violations) for rw in audit.runways),
+        total_closure_conflicts=sum(
+            len(rw.closure_conflicts) for rw in audit.runways
+        ),
+        has_capacity=has_capacity,
+        total_capacity_violations=sum(
+            len(rw.capacity_violations) for rw in audit.runways
+        ),
+        runways=runways,
+    )
+
+
+def _require_validate_actual_audit_data(db: sqlite3.Connection, batch_id: str) -> dict:
+    """Load audit inputs, translating missing/wrong-mode batches to HTTP errors."""
+    data = load_actual_audit_inputs(db, batch_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"批次不存在: {batch_id}")
+    if data["mode"] != "validate":
+        raise HTTPException(
+            status_code=422,
+            detail=f"仅 validate 批次支持离场实绩审计，当前批次模式: {data['mode']}",
+        )
+    return data
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/actuals",
+    response_model=ActualsSubmitResponse,
+    tags=["actuals"],
+)
+def submit_batch_actuals(
+    batch_id: str,
+    req: ActualsSubmitRequest,
+    db: sqlite3.Connection = Depends(get_write_db),
+) -> ActualsSubmitResponse:
+    """批量上报已保存 validate 批次的离场实绩（整批原子处理，不改原计划）。
+
+    每条含 ``flight_no``、带时区的 ``actual_off`` 与正整数 ``revision``。
+    针对同航班的已保存实绩：**高版本替换**；**等版本同值幂等**；
+    **低版本**或**等版本异值**整批拒绝（409）。航班号不属于批次冻结
+    计划、或同一请求内重复出现返回 422；任一校验失败整批回滚，不写入
+    任何实绩。批次不存在返回 404，非 validate 批次返回 422。
+
+    成功时返回每条的落库结果（``created`` / ``replaced`` / ``unchanged``，
+    按请求顺序）以及提交后立即重算的审计结果（形状同 GET actual-audit）。
+    """
+    data = _require_validate_actual_audit_data(db, batch_id)
+    items = [
+        ActualIn(
+            flight_no=item.flight_no,
+            actual_off=ensure_utc(item.actual_off),
+            revision=item.revision,
+        )
+        for item in req.actuals
+    ]
+    try:
+        accepted = submit_actuals(db, batch_id, data, items)
+    except ActualsSubmissionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    # Re-read within the same write transaction so the returned audit
+    # reflects exactly what this request committed (and nothing else).
+    data = load_actual_audit_inputs(db, batch_id)
+    audit = build_actual_audit(data, batch_id=batch_id)
+    runway_outs = [_runway_actual_audit_out(rw) for rw in audit.runways]
+    has_capacity = any(rw.capacity is not None for rw in audit.runways)
+    return ActualsSubmitResponse(
+        batch_id=audit.batch_id,
+        created_at=audit.created_at,
+        total_runways=len(audit.runways),
+        total_reported=sum(rw.reported_count for rw in audit.runways),
+        total_unreported=sum(len(rw.unreported) for rw in audit.runways),
+        total_violations=sum(len(rw.violations) for rw in audit.runways),
+        total_closure_conflicts=sum(
+            len(rw.closure_conflicts) for rw in audit.runways
+        ),
+        has_capacity=has_capacity,
+        total_capacity_violations=sum(
+            len(rw.capacity_violations) for rw in audit.runways
+        ),
+        runways=runway_outs,
+        accepted_count=len(accepted),
+        accepted=[
+            AcceptedActualOut(
+                flight_no=a.flight_no,
+                actual_off=a.actual_off,
+                revision=a.revision,
+                status=a.status,
+            )
+            for a in accepted
+        ],
+    )
+
+
+@app.get(
+    "/api/v1/batches/{batch_id}/actual-audit",
+    response_model=ActualAuditResponse,
+    tags=["actuals"],
+)
+def get_batch_actual_audit(
+    batch_id: str, db: sqlite3.Connection = Depends(get_db)
+) -> ActualAuditResponse:
+    """离场实绩审计（只读）：按冻结矩阵/关闭窗口/容量重算已上报实绩。
+
+    每条跑道仅取**已上报**航班，按 ``(实际时刻, 航班号)`` 稳定排序，
+    沿用该批次冻结的尾流矩阵、关闭窗口与滚动容量规则重新计算尾流违规、
+    关闭窗口冲突与容量超限，返回违规明细、各航班当前修订号与**未上报**
+    名单。结果每次读取都由冻结批次与当前实绩重新推导：补报或更正改变
+    相邻关系及容量窗口时，原先成立的违规会自动撤掉；服务重启后结果一致。
+    批次不存在返回 404，非 validate 批次返回 422。
+    """
+    data = _require_validate_actual_audit_data(db, batch_id)
+    audit = build_actual_audit(data, batch_id=batch_id)
+    return _actual_audit_response(audit)
